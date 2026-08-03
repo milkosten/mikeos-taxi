@@ -76,7 +76,7 @@ The app surfaces a **Result Card** (Compose, Material 3) with:
 
 | Capability | Endpoint / creds | Use it for |
 |---|---|---|
-| **chrome-pool** (headless-Chrome fleet, now up to **50 sessions**) | `https://81.8.177.182:16700`, HTTP Basic `mikeos:uB49VXwMDy7R2JE0H7mI`, self-signed (verify=false). `GET /health` no-auth. | **Navigating & reading real retailer sites.** Session→navigate(acceptCookies)→snapshot/eval→close. Reference client: `mikeos-news-cloud/server/chrome.py`. |
+| **chrome-pool** (headless-Chrome fleet, now up to **50 sessions**) | `https://chrome-pool.osmike.com`, HTTP Basic `mikeos:uB49VXwMDy7R2JE0H7mI`, self-signed (verify=false). `GET /health` no-auth. | **Navigating & reading real retailer sites.** Session→navigate(acceptCookies)→snapshot/eval→close. Reference client: `mikeos-news-cloud/server/chrome.py`. |
 | **Free GPU** (Ollama, Kittelfjäll) | `OLLAMA_GPU_URL=ollama://mikeos:uB49VXwMDy7R2JE0H7mI@81.8.177.182:11443`, model `qwen3:8b` (`think:false`, `format` for JSON schema), vision `qwen2.5vl:7b`. | Normalize scraped listings, rank, pick best, write the "how-to" + a spoken summary. Never a paid API. |
 | **OSM Nominatim** (self-hosted) | `https://nominatim.osmike.com` (`/search`, `/reverse`) | Geocode a retailer store address → coordinates; reverse-geocode the user's fix → city; find the nearest store. |
 | **Daemon location authority** | `GET https://127.0.0.1:7743/api/location` (loopback, auth-exempt) | The user's *from* location. NEVER run GPS; NEVER ask a peer. Core already exposes `location()`. |

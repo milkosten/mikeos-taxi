@@ -14,37 +14,23 @@ import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 /**
- * Talks to **mikeos-taxi-cloud** — the 5%-fee ride-hailing backend (FastAPI + Postgres on
- * Railway, dual-auth → user_id; drivers and clients are both users).
+ * Talks to **mikeos-taxi-cloud** — the 5%-fee ride-hailing backend (FastAPI + Postgres, self-hosted
+ * at `taxi-api.osmike.com`, dual-auth → user_id; drivers and clients are both users).
  *
- * THE PITCH this app exists to prove: Uber takes ~20–25% of the fare. MikeTaxi takes **5%**,
- * the driver keeps **95%**, because MikeOS pays ~€0 per ride (our own OSRM routing, Nominatim
- * geocoding, dashcam→MikeMaps imagery, tiles.osmike.com). Every estimate surfaces the split.
+ * THE PITCH: Uber takes ~20–25% of the fare. MikeTaxi takes **5%**, the driver keeps **95%**,
+ * because MikeOS pays ~€0 per ride. Every estimate surfaces the split.
  *
- * Auth: every call carries `X-API-KEY: <hive agent key>` (from
- * [com.mikeos.core.hive.HiveIdentity] / the installed [com.mikeos.core.agent.MikeAgent]);
- * the cloud resolves it to a `user_id`.
+ * Auth: every call carries `X-API-KEY: <hive agent key>`; the cloud resolves it to a `user_id`.
+ * TLS: public LE cert → a STANDARD OkHttpClient (with DoH for flaky system DNS).
  *
- * TLS: Railway public cert → a STANDARD OkHttpClient (with DoH for flaky system DNS), never
- * the loopback trust-all client.
- *
- * House rules honoured: never trust HTTP 200 alone (verify a real id / a `status` came back);
- * numeric fields sent as numbers (an empty-string in an INTEGER column silently 422s the write).
- *
- * API (per docs/services/taxi.md):
- *   POST /api/taxi/drivers/register   -> {"driver":{...}}
- *   POST /api/taxi/drivers/status     -> {"driver":{...}} | {"status":"online|offline"}
- *   GET  /api/taxi/estimate?from=&to= -> {distance_km,duration_min,fare,platform_fee,driver_payout,currency}
- *   POST /api/taxi/rides              -> {"ride":{...}}  (matches nearest online driver)
- *   GET  /api/taxi/rides/{id}         -> {"ride":{...}}  (status + driver live pos)
- *   POST /api/taxi/rides/{id}/accept|arrive|start|complete|cancel -> {"ride":{...}}
- *   GET  /api/taxi/rides?role=driver|client -> {"rides":[...]}
- *   GET  /api/health
+ * Wire format matches the live cloud: money fields are `*_eur`, ride locations are nested
+ * `pickup`/`dropoff` `{lat,lon,label}`, a driver is keyed by `user_id`, and `verification_status`
+ * gates go-online. Never trust HTTP 200 alone; numeric fields sent as numbers.
  */
 class TaxiCloudClient(
     private val baseUrl: String = BuildConfig.TAXI_CLOUD_BASE_URL,
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .dns(Doh.dns)                          // phone's system DNS is flaky — resolve via Cloudflare
+        .dns(Doh.dns)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .callTimeout(40, TimeUnit.SECONDS)
@@ -54,7 +40,6 @@ class TaxiCloudClient(
 
     // ---- wire types ------------------------------------------------------------------------
 
-    /** A fare estimate for a pickup→dropoff, with the all-important 95/5 split. */
     data class Estimate(
         val distanceKm: Double,
         val durationMin: Double,
@@ -64,31 +49,51 @@ class TaxiCloudClient(
         val currency: String,
     )
 
-    /** A driver profile as stored by the cloud. */
     data class Driver(
-        val id: String,
+        val id: String,                       // == user_id
+        val displayName: String?,
         val vehicleMake: String?,
         val vehicleModel: String?,
         val plate: String?,
         val dashcamActive: Boolean,
         val online: Boolean,
+        val verificationStatus: String,       // unverified | pending | rejected | approved
     )
 
-    /** A ride and its live state. `driverLat/Lon` populate once a driver is matched + moving. */
     data class Ride(
         val id: String,
         val status: String,
-        val fromLat: Double?,
-        val fromLon: Double?,
-        val toLat: Double?,
-        val toLon: Double?,
+        val fromLat: Double?, val fromLon: Double?, val fromLabel: String?,
+        val toLat: Double?, val toLon: Double?, val toLabel: String?,
         val fare: Double?,
         val platformFee: Double?,
         val driverPayout: Double?,
         val currency: String?,
-        val driverLat: Double?,
-        val driverLon: Double?,
-        val driverName: String?,
+        val driverLat: Double?, val driverLon: Double?, val driverName: String?,
+    )
+
+    /** One document in the driver onboarding funnel. */
+    data class DocItem(
+        val type: String,
+        val label: String,
+        val required: Boolean,
+        val status: String,                   // missing | pending | approved | rejected | expired
+        val expiresAt: String?,
+        val reviewNote: String?,
+    )
+
+    /** A MikeMaps place-search result. */
+    data class Place(val name: String, val lat: Double, val lon: Double)
+
+    /** A driver's accrued earnings (the ledger balance; payout disbursal is gated). */
+    data class Earnings(val totalEur: Double, val weekEur: Double, val rides: Int)
+
+    /** The driver onboarding checklist + whether the driver may go online. */
+    data class Requirements(
+        val registered: Boolean,
+        val verificationStatus: String,
+        val canGoOnline: Boolean,
+        val documents: List<DocItem>,
     )
 
     private fun req(apiKey: String, path: String): Request.Builder =
@@ -101,10 +106,6 @@ class TaxiCloudClient(
 
     // ---- estimate --------------------------------------------------------------------------
 
-    /**
-     * Fare estimate -> `GET /api/taxi/estimate?from=lat,lon&to=lat,lon`. Null on failure.
-     * Never throws.
-     */
     suspend fun estimate(
         apiKey: String,
         fromLat: Double, fromLon: Double,
@@ -115,112 +116,90 @@ class TaxiCloudClient(
             client.newCall(req(apiKey, path).get().build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "estimate HTTP ${resp.code}: $raw")
-                    return@withContext null
+                    Log.w(TAG, "estimate HTTP ${resp.code}: $raw"); return@withContext null
                 }
                 val o = runCatching { JSONObject(raw) }.getOrNull() ?: return@withContext null
-                val fare = o.optDouble("fare", Double.NaN)
-                if (fare.isNaN()) {
-                    Log.w(TAG, "estimate 200 but no fare: $raw")
-                    return@withContext null
-                }
-                val fee = o.optDouble("platform_fee", fare * 0.05)
+                val fare = o.optDouble("fare_eur", Double.NaN)
+                if (fare.isNaN()) { Log.w(TAG, "estimate 200 but no fare_eur: $raw"); return@withContext null }
+                val fee = o.optDouble("platform_fee_eur", fare * 0.05)
                 Estimate(
                     distanceKm = o.optDouble("distance_km", 0.0),
                     durationMin = o.optDouble("duration_min", 0.0),
                     fare = fare,
                     platformFee = fee,
-                    driverPayout = o.optDouble("driver_payout", fare - fee),
-                    currency = o.str("currency") ?: "EUR",
+                    driverPayout = o.optDouble("driver_payout_eur", fare - fee),
+                    currency = "EUR",
                 )
             }
         } catch (e: Exception) {
-            Log.w(TAG, "estimate failed: ${e.message}")
-            null
+            Log.w(TAG, "estimate failed: ${e.message}"); null
         }
     }
 
     // ---- client: request + track a ride ----------------------------------------------------
 
-    /**
-     * Request a ride -> `POST /api/taxi/rides`. `scheduledForIso` (ISO-8601) requests a future
-     * pickup (≥1h lead enforced server-side); omit for a "now" ride. Returns the created Ride
-     * (verified: a real id + status came back) or null. Never throws.
-     */
     suspend fun requestRide(
         apiKey: String,
         fromLat: Double, fromLon: Double,
         toLat: Double, toLon: Double,
+        fromLabel: String? = null, toLabel: String? = null,
         scheduledForIso: String? = null,
     ): Ride? = withContext(Dispatchers.IO) {
         val payload = JSONObject()
-            .put("from", JSONObject().put("lat", fromLat).put("lon", fromLon))
-            .put("to", JSONObject().put("lat", toLat).put("lon", toLon))
+            .put("pickup", JSONObject().put("lat", fromLat).put("lon", fromLon)
+                .put("label", fromLabel ?: "Pickup"))
+            .put("dropoff", JSONObject().put("lat", toLat).put("lon", toLon)
+                .put("label", toLabel ?: "Drop-off"))
             .apply { if (!scheduledForIso.isNullOrBlank()) put("scheduled_for", scheduledForIso) }
             .toString().toRequestBody(jsonMedia)
         postRide(apiKey, "/api/taxi/rides", payload, "requestRide")
     }
 
-    /** Poll a ride -> `GET /api/taxi/rides/{id}`. Null if missing/unreachable. */
+    /** Poll a ride -> `GET /api/taxi/rides/{id}` -> {ride, driver_location}. */
     suspend fun getRide(apiKey: String, id: String): Ride? = withContext(Dispatchers.IO) {
         try {
             client.newCall(req(apiKey, "/api/taxi/rides/${enc(id)}").get().build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "getRide HTTP ${resp.code}: $raw")
-                    return@withContext null
-                }
-                val o = runCatching { JSONObject(raw).optJSONObject("ride") }.getOrNull()
-                    ?: runCatching { JSONObject(raw) }.getOrNull()
-                o?.let { parseRide(it) }
+                if (!resp.isSuccessful) { Log.w(TAG, "getRide HTTP ${resp.code}: $raw"); return@withContext null }
+                val top = runCatching { JSONObject(raw) }.getOrNull() ?: return@withContext null
+                val rideObj = top.optJSONObject("ride") ?: top
+                parseRide(rideObj, top.optJSONObject("driver_location"))
             }
         } catch (e: Exception) {
-            Log.w(TAG, "getRide failed: ${e.message}")
-            null
+            Log.w(TAG, "getRide failed: ${e.message}"); null
         }
     }
 
-    /** My rides -> `GET /api/taxi/rides?role=driver|client`. Empty on failure. */
     suspend fun myRides(apiKey: String, role: String): List<Ride> = withContext(Dispatchers.IO) {
         try {
             client.newCall(req(apiKey, "/api/taxi/rides?role=${enc(role)}").get().build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "myRides HTTP ${resp.code}: $raw")
-                    return@withContext emptyList()
-                }
+                if (!resp.isSuccessful) { Log.w(TAG, "myRides HTTP ${resp.code}: $raw"); return@withContext emptyList() }
                 val arr = runCatching { JSONObject(raw).optJSONArray("rides") }.getOrNull()
                     ?: runCatching { JSONArray(raw) }.getOrNull()
                     ?: return@withContext emptyList()
-                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { parseRide(it) }
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { parseRide(it, null) }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "myRides failed: ${e.message}")
-            emptyList()
+            Log.w(TAG, "myRides failed: ${e.message}"); emptyList()
         }
     }
 
-    // ---- lifecycle transitions (driver + client) -------------------------------------------
-
-    /** POST one of accept|arrive|start|complete|cancel on a ride. Returns the updated Ride or null. */
+    /** POST accept|arrive|start|complete|cancel on a ride. Returns the updated Ride or null. */
     suspend fun transition(apiKey: String, id: String, action: String): Ride? = withContext(Dispatchers.IO) {
-        val body = "{}".toRequestBody(jsonMedia)
-        postRide(apiKey, "/api/taxi/rides/${enc(id)}/$action", body, "transition:$action")
+        postRide(apiKey, "/api/taxi/rides/${enc(id)}/$action", "{}".toRequestBody(jsonMedia), "transition:$action")
     }
 
-    // ---- driver: register + status ---------------------------------------------------------
+    // ---- driver: register / status / me ----------------------------------------------------
 
-    /**
-     * Become a driver -> `POST /api/taxi/drivers/register`. **A dashcam is mandatory** — the
-     * cloud rejects a registration with `dashcam_active=false`, and this app enforces it in the
-     * UI too. Returns the created Driver or null. Never throws.
-     */
     suspend fun registerDriver(
         apiKey: String,
         make: String, model: String, plate: String,
         dashcamActive: Boolean,
+        displayName: String? = null,
     ): Driver? = withContext(Dispatchers.IO) {
         val payload = JSONObject()
+            .put("display_name", displayName ?: "$make $model".trim().ifBlank { plate })
             .put("vehicle_make", make)
             .put("vehicle_model", model)
             .put("plate", plate)
@@ -229,132 +208,209 @@ class TaxiCloudClient(
         try {
             client.newCall(req(apiKey, "/api/taxi/drivers/register").post(payload).build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "registerDriver HTTP ${resp.code}: $raw")
-                    return@withContext null
-                }
+                if (!resp.isSuccessful) { Log.w(TAG, "registerDriver HTTP ${resp.code}: $raw"); return@withContext null }
                 val o = runCatching { JSONObject(raw).optJSONObject("driver") }.getOrNull()
                     ?: runCatching { JSONObject(raw) }.getOrNull()
-                val id = o?.optString("id").takeUnless { it.isNullOrBlank() }
-                if (id == null) { Log.w(TAG, "registerDriver 200 but no id: $raw"); return@withContext null }
-                parseDriver(o!!)
+                if (o == null || o.str("user_id") == null) { Log.w(TAG, "registerDriver 200 but no user_id: $raw"); return@withContext null }
+                parseDriver(o)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "registerDriver failed: ${e.message}")
-            null
+            Log.w(TAG, "registerDriver failed: ${e.message}"); null
         }
     }
 
+    /** The caller's own driver profile -> `GET /api/taxi/drivers/me`. Null if not a driver. */
+    suspend fun driverMe(apiKey: String): Driver? = withContext(Dispatchers.IO) {
+        try {
+            client.newCall(req(apiKey, "/api/taxi/drivers/me").get().build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) return@withContext null
+                val o = runCatching { JSONObject(raw).optJSONObject("driver") }.getOrNull()
+                if (o == null || o == JSONObject.NULL) null else parseDriver(o)
+            }
+        } catch (e: Exception) { null }
+    }
+
     /**
-     * Go online/offline + push the current live position -> `POST /api/taxi/drivers/status`.
-     * The `{lat,lon}` come from the daemon's shared fix (never our own GPS). Returns true when
-     * the cloud confirms the new state. Never throws.
+     * Go online/offline + push the current position -> `POST /api/taxi/drivers/status`.
+     * The cloud REQUIRES lat/lon, so we never send online without a fix. Returns a result that
+     * distinguishes "not verified yet" (403) from other failures so the UI can guide the driver.
      */
+    enum class StatusResult { OK, BLOCKED_UNVERIFIED, FAILED }
+
     suspend fun setDriverStatus(
-        apiKey: String,
-        online: Boolean,
-        lat: Double?, lon: Double?,
-    ): Boolean = withContext(Dispatchers.IO) {
+        apiKey: String, online: Boolean, lat: Double?, lon: Double?,
+    ): StatusResult = withContext(Dispatchers.IO) {
+        if (online && (lat == null || lon == null)) return@withContext StatusResult.FAILED
         val payload = JSONObject()
             .put("online", online)
-            .apply {
-                if (lat != null && lon != null) {
-                    put("lat", lat); put("lon", lon)
-                }
-            }
+            .put("lat", lat ?: 0.0).put("lon", lon ?: 0.0)
             .toString().toRequestBody(jsonMedia)
         try {
             client.newCall(req(apiKey, "/api/taxi/drivers/status").post(payload).build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "setDriverStatus HTTP ${resp.code}: $raw")
-                    return@withContext false
-                }
-                // Never-trust-200: confirm the cloud echoes a state.
+                if (resp.code == 403) { Log.w(TAG, "setDriverStatus blocked (unverified): $raw"); return@withContext StatusResult.BLOCKED_UNVERIFIED }
+                if (!resp.isSuccessful) { Log.w(TAG, "setDriverStatus HTTP ${resp.code}: $raw"); return@withContext StatusResult.FAILED }
                 val o = runCatching { JSONObject(raw) }.getOrNull()
-                val ok = o != null && (o.has("driver") || o.has("status") || o.has("online"))
-                if (!ok) Log.w(TAG, "setDriverStatus 200 but no state echoed: $raw")
-                ok
+                if (o != null && (o.has("driver") || o.has("status") || o.has("online"))) StatusResult.OK else StatusResult.FAILED
             }
         } catch (e: Exception) {
-            Log.w(TAG, "setDriverStatus failed: ${e.message}")
-            false
+            Log.w(TAG, "setDriverStatus failed: ${e.message}"); StatusResult.FAILED
         }
     }
 
-    /** Health -> `GET /api/health`. True if the cloud answers 2xx. */
+    // ---- driver verification (onboarding funnel) -------------------------------------------
+
+    suspend fun requirements(apiKey: String): Requirements? = withContext(Dispatchers.IO) {
+        try {
+            client.newCall(req(apiKey, "/api/taxi/drivers/requirements").get().build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) { Log.w(TAG, "requirements HTTP ${resp.code}: $raw"); return@withContext null }
+                val o = runCatching { JSONObject(raw) }.getOrNull() ?: return@withContext null
+                val arr = o.optJSONArray("documents") ?: JSONArray()
+                val docs = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.map { d ->
+                    DocItem(
+                        type = d.optString("type"),
+                        label = d.optString("label"),
+                        required = d.optBoolean("required", false),
+                        status = d.optString("status", "missing"),
+                        expiresAt = d.str("expires_at"),
+                        reviewNote = d.str("review_note"),
+                    )
+                }
+                Requirements(
+                    registered = o.optBoolean("registered", false),
+                    verificationStatus = o.optString("verification_status", "unverified"),
+                    canGoOnline = o.optBoolean("can_go_online", false),
+                    documents = docs,
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "requirements failed: ${e.message}"); null
+        }
+    }
+
+    /** Submit (or resubmit) a document -> `POST /api/taxi/drivers/documents`. */
+    suspend fun submitDocument(
+        apiKey: String, docType: String, reference: String?, expiresIso: String?,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val payload = JSONObject()
+            .put("doc_type", docType)
+            .apply {
+                if (!reference.isNullOrBlank()) {
+                    put("storage_ref", reference)
+                    put("meta", JSONObject().put("reference", reference))
+                }
+                if (!expiresIso.isNullOrBlank()) put("expires_at", expiresIso)
+            }
+            .toString().toRequestBody(jsonMedia)
+        try {
+            client.newCall(req(apiKey, "/api/taxi/drivers/documents").post(payload).build()).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) { Log.w(TAG, "submitDocument HTTP ${resp.code}: $raw"); return@withContext false }
+                runCatching { JSONObject(raw).has("document") }.getOrDefault(false)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "submitDocument failed: ${e.message}"); false
+        }
+    }
+
+    // ---- MikeMaps search + earnings --------------------------------------------------------
+
+    /** Place search -> `GET /api/taxi/geocode?q=`. Empty on failure. */
+    suspend fun geocode(apiKey: String, q: String): List<Place> = withContext(Dispatchers.IO) {
+        if (q.trim().length < 2) return@withContext emptyList()
+        try {
+            client.newCall(req(apiKey, "/api/taxi/geocode?q=${enc(q)}").get().build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext emptyList()
+                val arr = runCatching { JSONObject(resp.body?.string().orEmpty()).optJSONArray("results") }.getOrNull()
+                    ?: return@withContext emptyList()
+                (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }.mapNotNull { o ->
+                    val name = o.str("name") ?: return@mapNotNull null
+                    val lat = o.optDouble("lat", Double.NaN); val lon = o.optDouble("lon", Double.NaN)
+                    if (lat.isNaN() || lon.isNaN()) null else Place(name, lat, lon)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "geocode failed: ${e.message}"); emptyList()
+        }
+    }
+
+    /** Driver earnings -> `GET /api/taxi/earnings`. Null on failure. */
+    suspend fun earnings(apiKey: String): Earnings? = withContext(Dispatchers.IO) {
+        try {
+            client.newCall(req(apiKey, "/api/taxi/earnings").get().build()).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext null
+                val o = runCatching { JSONObject(resp.body?.string().orEmpty()) }.getOrNull() ?: return@withContext null
+                Earnings(
+                    totalEur = o.optDouble("total_earned_eur", 0.0),
+                    weekEur = o.optDouble("this_week_eur", 0.0),
+                    rides = o.optInt("rides", 0),
+                )
+            }
+        } catch (e: Exception) { null }
+    }
+
     suspend fun health(): Boolean = withContext(Dispatchers.IO) {
         try {
             client.newCall(Request.Builder().url("$baseUrl/api/health").get().build()).execute()
                 .use { it.isSuccessful }
-        } catch (e: Exception) {
-            false
-        }
+        } catch (e: Exception) { false }
     }
 
-    // ---- shared POST-a-ride helper + parsing ------------------------------------------------
+    // ---- parsing ---------------------------------------------------------------------------
 
     private fun postRide(apiKey: String, path: String, body: okhttp3.RequestBody, tag: String): Ride? {
         return try {
             client.newCall(req(apiKey, path).post(body).build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    Log.w(TAG, "$tag HTTP ${resp.code}: $raw")
-                    return null
-                }
+                if (!resp.isSuccessful) { Log.w(TAG, "$tag HTTP ${resp.code}: $raw"); return null }
                 val o = runCatching { JSONObject(raw).optJSONObject("ride") }.getOrNull()
                     ?: runCatching { JSONObject(raw) }.getOrNull()
                 val id = o?.optString("id").takeUnless { it.isNullOrBlank() }
                 val status = o?.optString("status").takeUnless { it.isNullOrBlank() }
-                if (id == null || status == null) {
-                    Log.w(TAG, "$tag 200 but no id/status: $raw")
-                    return null
-                }
-                parseRide(o!!)
+                if (id == null || status == null) { Log.w(TAG, "$tag 200 but no id/status: $raw"); return null }
+                parseRide(o!!, null)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "$tag failed: ${e.message}")
-            null
+            Log.w(TAG, "$tag failed: ${e.message}"); null
         }
     }
 
     private fun parseDriver(o: JSONObject): Driver = Driver(
-        id = o.optString("id"),
+        id = o.str("user_id") ?: o.optString("id"),
+        displayName = o.str("display_name"),
         vehicleMake = o.str("vehicle_make"),
         vehicleModel = o.str("vehicle_model"),
         plate = o.str("plate"),
         dashcamActive = o.optBoolean("dashcam_active", false),
         online = o.optBoolean("online", false),
+        verificationStatus = o.optString("verification_status", "unverified"),
     )
 
-    private fun parseRide(o: JSONObject): Ride {
-        // Coords may be nested under from/to objects or flattened as from_lat etc.
-        val from = o.optJSONObject("from")
-        val to = o.optJSONObject("to")
-        val driver = o.optJSONObject("driver")
-        fun d(obj: JSONObject?, k: String, flat: String): Double? {
-            val v = obj?.optDouble(k, Double.NaN) ?: o.optDouble(flat, Double.NaN)
-            return v?.takeUnless { it.isNaN() }
-        }
+    private fun parseRide(o: JSONObject, driverLoc: JSONObject?): Ride {
+        val pickup = o.optJSONObject("pickup")
+        val dropoff = o.optJSONObject("dropoff")
+        fun dbl(v: Double) = v.takeUnless { it.isNaN() }
         return Ride(
             id = o.optString("id"),
             status = o.optString("status", "unknown"),
-            fromLat = d(from, "lat", "from_lat"),
-            fromLon = d(from, "lon", "from_lon"),
-            toLat = d(to, "lat", "to_lat"),
-            toLon = d(to, "lon", "to_lon"),
-            fare = o.optDouble("fare", Double.NaN).takeUnless { it.isNaN() },
-            platformFee = o.optDouble("platform_fee", Double.NaN).takeUnless { it.isNaN() },
-            driverPayout = o.optDouble("driver_payout", Double.NaN).takeUnless { it.isNaN() },
-            currency = o.str("currency"),
-            driverLat = d(driver, "lat", "driver_lat"),
-            driverLon = d(driver, "lon", "driver_lon"),
-            driverName = driver?.optString("name")?.takeUnless { it.isBlank() || it == "null" }
-                ?: o.str("driver_name"),
+            fromLat = dbl(pickup?.optDouble("lat", Double.NaN) ?: Double.NaN),
+            fromLon = dbl(pickup?.optDouble("lon", Double.NaN) ?: Double.NaN),
+            fromLabel = pickup?.str("label"),
+            toLat = dbl(dropoff?.optDouble("lat", Double.NaN) ?: Double.NaN),
+            toLon = dbl(dropoff?.optDouble("lon", Double.NaN) ?: Double.NaN),
+            toLabel = dropoff?.str("label"),
+            fare = dbl(o.optDouble("fare_eur", Double.NaN)),
+            platformFee = dbl(o.optDouble("platform_fee_eur", Double.NaN)),
+            driverPayout = dbl(o.optDouble("driver_payout_eur", Double.NaN)),
+            currency = "EUR",
+            driverLat = dbl(driverLoc?.optDouble("lat", Double.NaN) ?: Double.NaN),
+            driverLon = dbl(driverLoc?.optDouble("lon", Double.NaN) ?: Double.NaN),
+            driverName = o.str("driver_user_id"),
         )
     }
 
-    /** optString that treats JSON null / blanks as null. */
     private fun JSONObject.str(key: String): String? =
         if (isNull(key)) null else optString(key).takeUnless { it.isBlank() || it == "null" }
 

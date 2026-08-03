@@ -109,8 +109,9 @@ object TaxiMikeAgent {
         bg.launch {
             runCatching {
                 lastPushMs = now
-                val ok = repo.setDriverStatus(online = true)
-                if (!ok) Log.w(TAG, "driver location push not confirmed by cloud")
+                val res = repo.setDriverStatus(online = true)
+                if (res != com.mikeos.taxi.net.TaxiCloudClient.StatusResult.OK)
+                    Log.w(TAG, "driver location push not confirmed by cloud ($res)")
             }.onFailure { Log.w(TAG, "driver location push failed: ${it.message}") }
             pushingLocation.set(false)
         }
@@ -169,10 +170,15 @@ object TaxiMikeAgent {
             paramsSchema = """{"online":"true to go online, false to go offline"}""",
             run = { args ->
                 val online = args.optBoolean("online", false)
-                val ok = repo.setDriverStatus(online)
+                val res = repo.setDriverStatus(online)
+                val ok = res == com.mikeos.taxi.net.TaxiCloudClient.StatusResult.OK
                 driverOnline = online && ok
-                if (ok) "driver is now ${if (online) "ONLINE" else "offline"}"
-                else "status change not confirmed by the cloud"
+                when {
+                    ok -> "driver is now ${if (online) "ONLINE" else "offline"}"
+                    res == com.mikeos.taxi.net.TaxiCloudClient.StatusResult.BLOCKED_UNVERIFIED ->
+                        "cannot go online yet — complete driver verification (licence, VTC card, insurance) first"
+                    else -> "status change not confirmed by the cloud"
+                }
             },
         ),
         Skill(

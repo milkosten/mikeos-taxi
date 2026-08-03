@@ -40,10 +40,11 @@ class TaxiRepository private constructor(private val appContext: Context) {
 
     suspend fun requestRide(
         fromLat: Double, fromLon: Double, toLat: Double, toLon: Double,
+        fromLabel: String? = null, toLabel: String? = null,
         scheduledForIso: String? = null,
     ): TaxiCloudClient.Ride? {
         val key = apiKey() ?: run { Log.w(TAG, "requestRide: no api key yet"); return null }
-        return cloud.requestRide(key, fromLat, fromLon, toLat, toLon, scheduledForIso)
+        return cloud.requestRide(key, fromLat, fromLon, toLat, toLon, fromLabel, toLabel, scheduledForIso)
     }
 
     suspend fun ride(id: String): TaxiCloudClient.Ride? {
@@ -70,11 +71,41 @@ class TaxiRepository private constructor(private val appContext: Context) {
         return cloud.registerDriver(key, make, model, plate, dashcamActive)
     }
 
-    /** Push online/offline + the daemon's live fix. Returns true when the cloud confirms. */
-    suspend fun setDriverStatus(online: Boolean): Boolean {
-        val key = apiKey() ?: run { Log.w(TAG, "setDriverStatus: no api key yet"); return false }
+    /** The caller's own driver profile (null if not registered as a driver). */
+    suspend fun driverMe(): TaxiCloudClient.Driver? {
+        val key = apiKey() ?: return null
+        return cloud.driverMe(key)
+    }
+
+    /** The onboarding checklist + whether the driver may go online. */
+    suspend fun requirements(): TaxiCloudClient.Requirements? {
+        val key = apiKey() ?: run { Log.w(TAG, "requirements: no api key yet"); return null }
+        return cloud.requirements(key)
+    }
+
+    /** Submit (or resubmit) a verification document. */
+    suspend fun submitDocument(docType: String, reference: String?, expiresIso: String?): Boolean {
+        val key = apiKey() ?: return false
+        return cloud.submitDocument(key, docType, reference, expiresIso)
+    }
+
+    /** Push online/offline + the daemon's live fix. Distinguishes the not-verified-yet case. */
+    suspend fun setDriverStatus(online: Boolean): TaxiCloudClient.StatusResult {
+        val key = apiKey() ?: run { Log.w(TAG, "setDriverStatus: no api key yet"); return TaxiCloudClient.StatusResult.FAILED }
         val fix = currentLocation()
         return cloud.setDriverStatus(key, online, fix?.lat, fix?.lon)
+    }
+
+    /** MikeMaps place search (type a destination instead of lat,lon). */
+    suspend fun geocode(q: String): List<TaxiCloudClient.Place> {
+        val key = apiKey() ?: return emptyList()
+        return cloud.geocode(key, q)
+    }
+
+    /** The driver's accrued earnings (ledger balance). */
+    suspend fun earnings(): TaxiCloudClient.Earnings? {
+        val key = apiKey() ?: return null
+        return cloud.earnings(key)
     }
 
     suspend fun cloudHealthy(): Boolean = cloud.health()

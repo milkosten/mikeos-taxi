@@ -14,7 +14,7 @@ android {
         applicationId = "com.mikeos.taxi"
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
+        versionCode = 5
         versionName = "0.1.0-foundation"
 
         // MikeDaemon runs ON the phone (loopback). Auth token is pinned for dev.
@@ -26,13 +26,14 @@ android {
             "\"7bdc23451b18b5801036f992b66a872670975d19\""
         )
 
-        // mikeos-taxi-cloud: the 5%-fee ride-hailing backend (FastAPI+Postgres on Railway,
-        // dual-auth → user_id). X-API-KEY = this app's hive agent key. A sibling agent is
-        // deploying it in parallel; swap this field when its live URL is confirmed.
+        // mikeos-taxi-cloud: the 5%-fee ride-hailing backend (FastAPI+Postgres,
+        // dual-auth → user_id). X-API-KEY = this app's hive agent key. Self-hosted on the
+        // media box (91.98.177.242) at the API host taxi-api.osmike.com (Caddy/Let's Encrypt).
+        // NOTE: taxi.osmike.com is the human web UI; the API lives at taxi-api.osmike.com.
         buildConfigField(
             "String",
             "TAXI_CLOUD_BASE_URL",
-            "\"https://mikeos-taxi-cloud-production.up.railway.app\""
+            "\"https://taxi-api.osmike.com\""
         )
 
         // MikeOS basemap: MapLibre GL style served from our own tile server (no Google).

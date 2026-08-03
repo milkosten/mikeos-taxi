@@ -26,6 +26,7 @@ data class ClientState(
     val dropoffLabel: String = "",
     val estimate: TaxiCloudClient.Estimate? = null,
     val activeRide: TaxiCloudClient.Ride? = null,     // set once requested; polled for status
+    val suggestions: List<TaxiCloudClient.Place> = emptyList(),  // MikeMaps search results
     val loading: Boolean = false,
     val notice: String? = null,
 )
@@ -39,9 +40,14 @@ data class DriverState(
     val registered: TaxiCloudClient.Driver? = null,
     val online: Boolean = false,
     val myRides: List<TaxiCloudClient.Ride> = emptyList(),
+    val requirements: TaxiCloudClient.Requirements? = null,   // onboarding funnel + go-online gate
+    val earnings: TaxiCloudClient.Earnings? = null,           // accrued ledger earnings
     val loading: Boolean = false,
     val notice: String? = null,
-)
+) {
+    /** A registered driver may only go online once fully verified. */
+    val canGoOnline: Boolean get() = requirements?.canGoOnline == true
+}
 
 class TaxiViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -69,7 +75,7 @@ class TaxiViewModel(app: Application) : AndroidViewModel(app) {
         if (_mode.value == m) return
         _mode.value = m
         prefs.edit().putString(KEY_MODE, m.name).apply()
-        if (m == Mode.DRIVER) refreshDriverRides()
+        if (m == Mode.DRIVER) refreshDriver()
     }
 
     private fun loadMode(): Mode =
@@ -96,6 +102,26 @@ class TaxiViewModel(app: Application) : AndroidViewModel(app) {
             dropoffLabel = label.ifBlank { "%.5f, %.5f".format(lat, lon) },
             estimate = null,
         )
+    }
+
+    /** MikeMaps place search — type a destination instead of lat,lon (debounced). */
+    private var searchJob: Job? = null
+    fun searchDropoff(query: String) {
+        searchJob?.cancel()
+        if (query.trim().length < 2) {
+            _client.value = _client.value.copy(suggestions = emptyList()); return
+        }
+        searchJob = viewModelScope.launch {
+            delay(280)
+            val places = repo.geocode(query)
+            _client.value = _client.value.copy(suggestions = places)
+        }
+    }
+
+    /** Choose a searched place as the drop-off. */
+    fun pickSuggestion(p: TaxiCloudClient.Place) {
+        setDropoff(p.lat, p.lon, p.name)
+        _client.value = _client.value.copy(suggestions = emptyList())
     }
 
     /** Parse a "lat, lon" text field into a drop-off. Returns false if it doesn't parse. */
@@ -133,7 +159,7 @@ class TaxiViewModel(app: Application) : AndroidViewModel(app) {
         val toLon = s.dropoffLon ?: return
         _client.value = s.copy(loading = true, notice = null)
         viewModelScope.launch {
-            val ride = repo.requestRide(from.lat, from.lon, toLat, toLon)
+            val ride = repo.requestRide(from.lat, from.lon, toLat, toLon, toLabel = s.dropoffLabel)
             if (ride == null) {
                 _client.value = _client.value.copy(loading = false, notice = "Ride request failed.")
                 return@launch
@@ -194,26 +220,68 @@ class TaxiViewModel(app: Application) : AndroidViewModel(app) {
         _driver.value = s.copy(loading = true, notice = null)
         viewModelScope.launch {
             val d = repo.registerDriver(s.make, s.model, s.plate, s.dashcamActive)
+            if (d == null) {
+                _driver.value = _driver.value.copy(loading = false, notice = "Registration failed (cloud offline?).")
+                return@launch
+            }
             _driver.value = _driver.value.copy(
-                loading = false,
-                registered = d,
-                notice = if (d == null) "Registration failed (cloud offline?)." else "Registered — you can go online.",
+                loading = false, registered = d,
+                notice = "Registered — now verify your documents to go online.",
             )
+            refreshDriver()   // pull the verification checklist
         }
     }
 
     fun setOnline(online: Boolean) {
+        // A registered-but-unverified driver can't go online — guide them to the funnel.
+        if (online && !_driver.value.canGoOnline) {
+            _driver.value = _driver.value.copy(notice = "Complete driver verification before going online.")
+            return
+        }
         _driver.value = _driver.value.copy(loading = true, notice = null)
         viewModelScope.launch {
-            val ok = repo.setDriverStatus(online)
-            // Tell the agent so its heartbeat starts/stops the deterministic location push.
-            TaxiMikeAgent.driverOnline = online && ok
+            val res = repo.setDriverStatus(online)
+            val nowOnline = online && res == TaxiCloudClient.StatusResult.OK
+            TaxiMikeAgent.driverOnline = nowOnline
             _driver.value = _driver.value.copy(
                 loading = false,
-                online = online && ok,
-                notice = if (!ok) "Status change not confirmed by the cloud." else null,
+                online = nowOnline,
+                notice = when (res) {
+                    TaxiCloudClient.StatusResult.OK -> null
+                    TaxiCloudClient.StatusResult.BLOCKED_UNVERIFIED -> "Complete driver verification before going online."
+                    TaxiCloudClient.StatusResult.FAILED ->
+                        if (online) "Couldn't go online — waiting for a location fix, or the cloud is offline."
+                        else "Status change not confirmed by the cloud."
+                },
             )
-            if (online && ok) refreshDriverRides()
+            if (res == TaxiCloudClient.StatusResult.BLOCKED_UNVERIFIED) refreshDriver()
+            if (nowOnline) refreshDriverRides()
+        }
+    }
+
+    /** Load the full driver picture: profile + verification checklist + rides. */
+    fun refreshDriver() {
+        viewModelScope.launch {
+            val d = repo.driverMe()
+            val reqs = if (d != null) repo.requirements() else null
+            val rides = if (d != null) repo.myRides("driver") else emptyList()
+            val earn = if (d != null) repo.earnings() else null
+            _driver.value = _driver.value.copy(
+                registered = d,
+                online = d?.online ?: false,
+                requirements = reqs,
+                myRides = rides,
+                earnings = earn,
+            )
+        }
+    }
+
+    /** Submit (or resubmit) one verification document, then reload the checklist. */
+    fun submitDocument(docType: String, reference: String, expiresIso: String?) {
+        viewModelScope.launch {
+            val ok = repo.submitDocument(docType, reference.ifBlank { null }, expiresIso)
+            _driver.value = _driver.value.copy(notice = if (ok) "Submitted — under review." else "Could not submit document.")
+            refreshDriver()
         }
     }
 

@@ -34,10 +34,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk   # OTA is the fleet-pr
 
 ## How it talks to the cloud + daemon
 
-- **Cloud:** `mikeos-taxi-cloud` (FastAPI+Postgres on Railway, dual-auth → user_id). Base URL is
-  the buildConfig field `TAXI_CLOUD_BASE_URL` (default
-  `https://mikeos-taxi-cloud-production.up.railway.app` — **swap when the sibling agent confirms
-  the live URL**). Client: `net/TaxiCloudClient.kt` — standard OkHttp (Railway public cert) + DoH,
+- **Cloud:** `mikeos-taxi-cloud` (FastAPI+Postgres, dual-auth → user_id: X-API-KEY **or** OAuth
+  Bearer JWKS). Base URL is the buildConfig field `TAXI_CLOUD_BASE_URL` (default
+  `https://taxi-api.osmike.com` — **self-hosted on the media box `91.98.177.242`, fronted by the
+  shared Caddy with Let's Encrypt TLS**; Postgres data on the RAID6 `/data/mikeos-taxi-pg`). The
+  human web UI is a separate app at `https://taxi.osmike.com` (`mikeos-taxi-web`). Client:
+  `net/TaxiCloudClient.kt` — standard OkHttp (public LE cert) + DoH,
   `X-API-KEY: <hive agent key>`. Endpoints: `/api/taxi/estimate`, `/api/taxi/rides[/{id}[/accept|
   arrive|start|complete|cancel]]`, `/api/taxi/drivers/register`, `/api/taxi/drivers/status`,
   `/api/taxi/rides?role=`. **Never-trust-200**: writes verify a real id/status came back.

@@ -37,6 +37,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -202,22 +203,32 @@ private fun ClientScreen(vm: TaxiViewModel) {
 
             Spacer(Modifier.height(12.dp))
             SectionLabel("Drop-off")
-            var dropText by remember { androidx.compose.runtime.mutableStateOf("") }
+            var dropText by remember { mutableStateOf("") }
             OutlinedTextField(
                 value = dropText,
-                onValueChange = { dropText = it },
+                onValueChange = { dropText = it; vm.searchDropoff(it) },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Destination as  lat, lon  (map-pin geocoding is TODO)") },
+                label = { Text("Search a destination — e.g. Monaco") },
                 singleLine = true,
             )
-            Spacer(Modifier.height(6.dp))
-            OutlinedButton(
-                onClick = {
-                    if (!vm.setDropoffFromText(dropText)) { /* notice set by VM path if needed */ }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Set drop-off") }
-
+            // MikeMaps search suggestions (our own Nominatim — no Google).
+            if (s.suggestions.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                Card(colors = CardDefaults.cardColors(containerColor = MikeSurface)) {
+                    Column(Modifier.fillMaxWidth()) {
+                        s.suggestions.forEach { place ->
+                            Text(
+                                place.name,
+                                color = MikeOnSurface, fontSize = 13.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { vm.pickSuggestion(place); dropText = place.name }
+                                    .padding(horizontal = 12.dp, vertical = 11.dp),
+                            )
+                        }
+                    }
+                }
+            }
             s.dropoffLat?.let {
                 Spacer(Modifier.height(6.dp))
                 Text("Drop-off: ${s.dropoffLabel}", color = MikeMuted, fontSize = 13.sp)
@@ -339,6 +350,8 @@ private fun DriverScreen(vm: TaxiViewModel) {
         ) {
             if (s.registered == null) {
                 DriverRegistration(s, vm)
+            } else if (!s.canGoOnline) {
+                DriverVerification(s, vm)
             } else {
                 DriverOnlinePanel(s, vm)
             }
@@ -397,6 +410,101 @@ private fun DriverRegistration(s: DriverState, vm: TaxiViewModel) {
     ) { Text("Register as driver", color = Color(0xFF0A0E14), fontWeight = FontWeight.Bold) }
 }
 
+// Documents whose expiry we ask for (licences / insurance / registration).
+private val EXPIRY_DOCS = setOf("driving_licence", "vtc_card", "insurance", "vehicle_registration")
+
+@Composable
+private fun DriverVerification(s: DriverState, vm: TaxiViewModel) {
+    val reqs = s.requirements
+    SectionLabel("Driver verification")
+    Text(
+        when (reqs?.verificationStatus) {
+            "pending" -> "Your documents are under review. You can go online once approved."
+            "rejected" -> "Some documents were rejected — read the notes and resubmit."
+            else -> "Submit these documents to get verified. You keep 95% of every fare."
+        },
+        color = MikeMuted, fontSize = 13.sp,
+    )
+    Spacer(Modifier.height(12.dp))
+    reqs?.documents?.forEach { doc -> DocRow(doc, vm) }
+    Spacer(Modifier.height(10.dp))
+    Text(
+        "🔒 A valid French VTC card and an active dashcam are required before you can go online.",
+        color = MikeMuted, fontSize = 12.sp,
+    )
+}
+
+@Composable
+private fun DocRow(doc: com.mikeos.taxi.net.TaxiCloudClient.DocItem, vm: TaxiViewModel) {
+    var open by remember { mutableStateOf(false) }
+    var ref by remember { mutableStateOf("") }
+    var expiry by remember { mutableStateOf("") }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MikeSurface),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        doc.label + if (doc.required) "" else "  (optional)",
+                        color = MikeOnSurface, fontWeight = FontWeight.SemiBold, fontSize = 14.sp,
+                    )
+                    doc.reviewNote?.let { Text(it, color = MikeRed, fontSize = 12.sp) }
+                }
+                StatusChip(doc.status)
+            }
+            if (doc.status != "approved") {
+                Spacer(Modifier.height(8.dp))
+                if (!open) {
+                    OutlinedButton(onClick = { open = true }) {
+                        Text(if (doc.status == "missing") "Provide" else "Resubmit")
+                    }
+                } else {
+                    OutlinedTextField(
+                        value = ref, onValueChange = { ref = it },
+                        label = { Text("Document number / reference") },
+                        singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (doc.type in EXPIRY_DOCS) {
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = expiry, onValueChange = { expiry = it },
+                            label = { Text("Expiry (YYYY-MM-DD, optional)") },
+                            singleLine = true, modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            val iso = expiry.trim().takeIf { it.isNotBlank() }?.let { "${it}T00:00:00Z" }
+                            vm.submitDocument(doc.type, ref, iso)
+                            open = false
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MikeAccent),
+                    ) { Text("Submit", color = Color(0xFF0A0E14), fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusChip(status: String) {
+    val bg: Color; val fg: Color
+    when (status) {
+        "approved" -> { bg = MikeGreen.copy(alpha = 0.18f); fg = MikeGreen }
+        "pending" -> { bg = Color(0x33FFB43A); fg = Color(0xFFFFCF6A) }
+        "rejected", "expired" -> { bg = MikeRed.copy(alpha = 0.18f); fg = MikeRed }
+        else -> { bg = MikeSurfaceVariant; fg = MikeMuted }
+    }
+    Box(
+        Modifier.clip(RoundedCornerShape(999.dp)).background(bg).padding(horizontal = 10.dp, vertical = 4.dp),
+    ) {
+        Text(status.replaceFirstChar { it.uppercase() }, color = fg, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
 @Composable
 private fun DriverOnlinePanel(s: DriverState, vm: TaxiViewModel) {
     val d = s.registered!!
@@ -429,6 +537,20 @@ private fun DriverOnlinePanel(s: DriverState, vm: TaxiViewModel) {
                 color = MikeMuted, fontSize = 12.sp)
         }
         Switch(checked = s.online, onCheckedChange = { vm.setOnline(it) })
+    }
+
+    s.earnings?.let { e ->
+        Spacer(Modifier.height(16.dp))
+        Card(colors = CardDefaults.cardColors(containerColor = MikeSurface)) {
+            Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                Text("Earnings", color = MikeMuted, fontSize = 13.sp)
+                Text("%.2f €".format(e.totalEur), color = MikeGreen, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "%.2f € this week · %d rides · you keep 95%%".format(e.weekEur, e.rides),
+                    color = MikeMuted, fontSize = 12.sp,
+                )
+            }
+        }
     }
 
     Spacer(Modifier.height(16.dp))
