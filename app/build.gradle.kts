@@ -14,7 +14,7 @@ android {
         applicationId = "com.mikeos.taxi"
         minSdk = 31
         targetSdk = 35
-        versionCode = 5
+        versionCode = 6
         versionName = "0.1.0-foundation"
 
         // MikeDaemon runs ON the phone (loopback). Auth token is pinned for dev.
