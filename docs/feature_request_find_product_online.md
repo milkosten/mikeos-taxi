@@ -89,7 +89,7 @@ POST   /session                                  -> { id | sessionId }         (
 POST   /session/{id}/navigate {url, acceptCookies:true}
 GET    /session/{id}/snapshot                    -> { text: <accessibility tree> }   # readable page
 POST   /session/{id}/eval {expression:"<JS>"}    -> { value: <string> }              # absolute hrefs, prices, stock
-POST   /session/{id}/close
+DELETE /session/{id}                             # close. NOT `POST .../close` — that 404s and leaks the session
 ```
 - **Reuse ONE session per retailer** (30-min TTL). `eval` returns `{"value":...}` — the param key is **`expression`** (not `code`/`script`).
 - **DataDome / bot-walls are real:** **Fnac & Darty challenge headless Chrome** (you'll see `DataDome CAPTCHA` in the snapshot) → skip them or use their store-locator only. **LDLC, Boulanger, Amazon.fr scrape fine.** Detect a CAPTCHA/`RootWebArea` with no products and fall through to the next retailer. **Log which retailers you dropped** — never silently return "nothing found" when a bot-wall was the cause.
