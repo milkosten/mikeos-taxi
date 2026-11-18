@@ -14,8 +14,8 @@ android {
         applicationId = "com.mikeos.taxi"
         minSdk = 31
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.1.0-foundation"
+        versionCode = 7
+        versionName = "0.1.0-foundation-r242"
 
         // MikeDaemon runs ON the phone (loopback). Auth token is pinned for dev.
         // We read the ONE shared location fix from GET /api/location here (never our own GPS).
